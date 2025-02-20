@@ -1,6 +1,8 @@
 import azure.identity, azure.mgmt.automation
 import argparse, os, termcolor, traceback, typing
+import requests
 
+ACCESS_TOKEN = None
 
 def print_status(status_type: str, text: str) -> None:
     '''Print text to terminal / append to file if specified. Status Types supported: `x`: red, `-`: red,`!`: yellow, `*`: blue, `+`: green'''
@@ -8,10 +10,12 @@ def print_status(status_type: str, text: str) -> None:
         status_type = f'[{status_type.lower()}]'
 
     color = 'white'
-    if status_type == '[-]' or status_type == '[x]':
+    if status_type == '[-]':
         color = 'red'
+    elif status_type == '[x]':
+        color = 'magenta'
     elif status_type == '[!]':
-        color = 'red'
+        color = 'yellow'
     elif status_type == '[*]':
         color = 'blue'
     elif status_type == '[+]':
@@ -24,10 +28,23 @@ def print_status(status_type: str, text: str) -> None:
     return  None
 
 
-def get_credentials() -> azure.identity.AzureCliCredential:
+def get_credentials(sub_id:str = None) -> azure.identity.AzureCliCredential:
     '''Grabs authentication token from CLI context (run `az login` prior to using script). Yes, this is a function just wrapping another function...'''
     try:
-        creds = azure.identity.AzureCliCredential()
+
+        if sub_id:
+            tenant=os.environ.get('AZURE_DIRECTORY_ID')
+            app=os.environ.get('AZURE_APPLICATION_ID')
+            secret=os.environ.get('AZURE_KEY_VALUE')
+            sub=sub_id
+
+            endpoint='https://management.azure.com'
+            cred = azure.identity.ClientSecretCredential(tenant_id=tenant, client_id=app, client_secret=secret)
+            access_token = cred.get_token(f'{endpoint}/.default')
+            creds = f'{access_token.token}'
+
+        else:
+            creds = azure.identity.AzureCliCredential()
     except Exception as err:
         print_status('x', f'Unable to locate credentials - did you try running `az login` in this terminal?\n{err}')
         exit()
@@ -96,16 +113,29 @@ def get_automation_runbooks(sub_id: str, res_grp: str, name: str) -> list:
 
 def get_runbook_contents(sub_id: str, res_grp: str, acc_name: str, rbk_name: str) -> typing.IO:
     '''Attempts to download content for a specified azure automation runbook'''
+    global ACCESS_TOKEN
     creds = get_credentials()
-    client = azure.mgmt.automation.AutomationClient(creds, sub_id)
+    client = (creds, sub_id)
 
     print_status('*', f'Attempting to export \'{rbk_name}\'')
     try:
         content = client.runbook.get_content(res_grp, acc_name, rbk_name)
     except Exception as err:
-        print_status('x', f'{err}')
-        return None
+        
+        try:
+            if ACCESS_TOKEN == None:
+                ACCESS_TOKEN = get_credentials(sub_id=sub_id)
+            
+            endpoint = f'https://management.azure.com/subscriptions/{sub_id}/resourceGroups/{res_grp}/providers/Microsoft.Automation/automationAccounts/{acc_name}/runbooks/{rbk_name}/content?api-version=2023-11-01'
+            res = requests.get(endpoint, headers={'Authorization': f'Bearer {ACCESS_TOKEN}'})
+            content = res.text
 
+        except Exception as err:
+        
+            print_status('x', f'{err}')
+        
+
+        
     return content
 
 
@@ -127,6 +157,7 @@ def export_runbooks(sub_id: str, args: argparse.Namespace) -> None:
 
             for book in runbooks:
                 content = get_runbook_contents(sub_id, book['ResourceGroup'], book['AutomationAccountName'], book['RunbookName'])
+
                 if not content:
                     continue
                 
@@ -139,7 +170,7 @@ def export_runbooks(sub_id: str, args: argparse.Namespace) -> None:
                     'Python2': 'py'
                 }
 
-                filepath = f'{args.download_directory}/{book["RunbookName"]}.{ext.get(book["RunbookType"], "ps1")}'
+                filepath = f'{args.download_directory}/{sub_id}_{book["RunbookName"]}.{ext.get(book["RunbookType"], "ps1")}'
                 with open(filepath, 'w') as exportfile:
                     exportfile.write(content)
     
@@ -179,7 +210,7 @@ if __name__ == '__main__':
             subscriptions = [args.subscription_id]
 
         for sub in subscriptions:
-            print_status('!', f'Attempting to locate and export automation runbooks within subscription \'{sub}\'')
+            print_status('*', f'Attempting to locate and export automation runbooks within subscription \'{sub}\'')
             export_runbooks(sub, args)
 
     except Exception as err:
